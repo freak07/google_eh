@@ -29,7 +29,10 @@ struct eh_completion {
 struct eh_request {
 	struct page *page;
 	void *priv;
-	struct list_head list;
+	union {
+		struct list_head list;    /* Used for pool and local_fifo */
+		struct llist_node lnode;  /* Used for lockless sw_fifo */
+	};
 };
 
 struct eh_request_pool {
@@ -38,11 +41,13 @@ struct eh_request_pool {
 	spinlock_t lock;
 };
 
+#if 0
 struct eh_sw_fifo {
 	struct list_head head;
 	int count;
 	spinlock_t lock;
 };
+#endif
 
 struct eh_device {
 	struct kobject kobj;
@@ -96,6 +101,7 @@ struct eh_device {
 	struct clk *clk;
 
 	int error_irq;
+	int comp_irq;
 
 	/*
 	 * no interrupts, need to use a polling
@@ -105,8 +111,8 @@ struct eh_device {
 
 	unsigned short quirks;
 
-	struct task_struct *comp_thread;
-	wait_queue_head_t comp_wq;
+	//struct task_struct *comp_thread;
+	//wait_queue_head_t comp_wq;
 	atomic_t nr_request;
 
 	eh_cb_fn comp_callback;
@@ -122,8 +128,13 @@ struct eh_device {
 	 */
 	struct eh_request_pool pool;
 	/* keep pending request */
-	struct eh_sw_fifo sw_fifo;
+	//struct eh_sw_fifo sw_fifo;
+	struct llist_head sw_fifo;       /* Lockless MPSC submission queue */
+	struct list_head local_fifo;     /* Consumer-only private FIFO */
 	atomic64_t nr_stall;
+
+	atomic64_t nr_hw_fifo_req;
+    atomic64_t nr_sw_fifo_req;
 #if IS_ENABLED(CONFIG_SOC_ZUMA) || IS_ENABLED(CONFIG_SOC_LGA)
 	int ip_index;
 #endif
