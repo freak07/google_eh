@@ -883,8 +883,10 @@ static irqreturn_t eh_comp_irq_thread(int irq, void *data)
 		flush_sw_fifo(eh_dev);
 
 	/* Power Management: declare hardware idle if no inflight requests */
+	spin_lock(&eh_dev->fifo_prod_lock);
 	if (atomic_read(&eh_dev->nr_request) == 0)
 		eh_declare_idle(eh_dev);
+	spin_unlock(&eh_dev->fifo_prod_lock);
 
 	return IRQ_HANDLED;
 }
