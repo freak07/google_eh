@@ -476,7 +476,7 @@ static void eh_setup_src_addr(struct eh_compress_desc *desc, struct page *page)
 }
 
 static void eh_setup_descriptor(struct eh_device *eh_dev, struct page *src_page,
-				unsigned int index)
+				unsigned int index, bool req_intr)
 {
 	struct eh_compress_desc *desc;
 
@@ -486,7 +486,7 @@ static void eh_setup_descriptor(struct eh_device *eh_dev, struct page *src_page,
 	/* mark it as pend for hardware */
 	desc->status = EH_CDESC_PENDING;
 
-	desc->intr_request = 1;
+	desc->intr_request = req_intr ? 1 : 0;
 }
 
 static void eh_compr_fifo_init(struct eh_device *eh_dev)
@@ -573,21 +573,6 @@ static void clear_eh_congested(void)
 		wake_up(&eh_compress_wait);
 }
 
-static void request_to_sw_fifo(struct eh_device *eh_dev,
-			    struct page *page, void *priv)
-{
-	struct eh_request *req;
-
-	while ((req = pool_alloc(&eh_dev->pool)) == NULL)
-		eh_congestion_wait(eh_dev, HZ/10);
-
-	req->page = page;
-	req->priv = priv;
-
-	/* Locklessly add to the fallback queue */
-	llist_add(&req->lnode, &eh_dev->sw_fifo);
-}
-
 /*
  * Return zero on success. Otherwise, return error number
  */
@@ -626,7 +611,7 @@ static void eh_declare_idle(struct eh_device *eh_dev)
 }
 
 static int request_to_hw_fifo(struct eh_device *eh_dev, struct page *page,
-			      void *priv, bool wake_up)
+			      void *priv, bool wake_up, bool req_intr)
 {
 	unsigned int write_idx;
 	struct eh_completion *compl;
@@ -641,7 +626,7 @@ static int request_to_hw_fifo(struct eh_device *eh_dev, struct page *page,
 
 	write_idx = fifo_write_index(eh_dev);
 
-	eh_setup_descriptor(eh_dev, page, write_idx);
+	eh_setup_descriptor(eh_dev, page, write_idx, req_intr);
 
 	compl = &eh_dev->completions[write_idx];
 	compl->priv = priv;
@@ -665,7 +650,7 @@ static void flush_sw_fifo(struct eh_device *eh_dev)
 
 	/* Process the private queue completely lock-free */
 	list_for_each_entry_safe(req, tmp, &eh_dev->local_fifo, list) {
-		if (request_to_hw_fifo(eh_dev, req->page, req->priv, true))
+		if (request_to_hw_fifo(eh_dev, req->page, req->priv, true, true))
 			break; /* hardware is full again */
 
 		list_del(&req->list);
@@ -673,6 +658,21 @@ static void flush_sw_fifo(struct eh_device *eh_dev)
 	}
 
 	clear_eh_congested();
+}
+
+static void request_to_sw_fifo(struct eh_device *eh_dev,
+			    struct page *page, void *priv)
+{
+	struct eh_request *req;
+
+	while ((req = pool_alloc(&eh_dev->pool)) == NULL)
+		eh_congestion_wait(eh_dev, HZ/10);
+
+	req->page = page;
+	req->priv = priv;
+
+	/* Locklessly add to the fallback queue */
+	llist_add(&req->lnode, &eh_dev->sw_fifo);
 }
 
 static void refill_hw_fifo(struct eh_device *eh_dev)
@@ -684,11 +684,12 @@ static void refill_hw_fifo(struct eh_device *eh_dev)
 
 	if (!list_empty(&eh_dev->local_fifo)) {
 		req = list_first_entry(&eh_dev->local_fifo, struct eh_request, list);
-		if (!request_to_hw_fifo(eh_dev, req->page, req->priv, true)) {
+		if (!request_to_hw_fifo(eh_dev, req->page, req->priv, true, true)) {
 			list_del(&req->list);
 			pool_free(&eh_dev->pool, req);
 		}
 	}
+
 	clear_eh_congested();
 }
 
@@ -1187,20 +1188,6 @@ static ssize_t sw_fifo_size_show(struct kobject *kobj, struct kobj_attribute *at
 }
 EH_ATTR_RO(sw_fifo_size);
 
-static ssize_t nr_hw_fifo_req_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    struct eh_device *eh_dev = container_of(kobj, struct eh_device, kobj);
-    return sysfs_emit(buf, "%llu\n", atomic64_read(&eh_dev->nr_hw_fifo_req));
-}
-EH_ATTR_RO(nr_hw_fifo_req);
-
-static ssize_t nr_sw_fifo_req_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    struct eh_device *eh_dev = container_of(kobj, struct eh_device, kobj);
-    return sysfs_emit(buf, "%llu\n", atomic64_read(&eh_dev->nr_sw_fifo_req));
-}
-EH_ATTR_RO(nr_sw_fifo_req);
-
 #if IS_ENABLED(CONFIG_SOC_LGA)
 static ssize_t hwacg_state_show(struct kobject *kobj, struct kobj_attribute *attr,
 		char *buf)
@@ -1249,8 +1236,6 @@ static struct attribute *eh_attrs[] = {
 	&nr_run_attr.attr,
 	&nr_compressed_attr.attr,
 	&sw_fifo_size_attr.attr,
-	&nr_hw_fifo_req_attr.attr,
-    &nr_sw_fifo_req_attr.attr,
 #if IS_ENABLED(CONFIG_SOC_LGA)
 	&hwacg_state_attr.attr,
 	&hwacg_threshold_ms_attr.attr,
@@ -1397,7 +1382,7 @@ int eh_compress_page(struct eh_device *eh_dev, struct page *page, void *priv)
 	 * If it fail to add the request into hw fifo, fallback it to
 	 * sw fifo.
 	 */
-	if (!request_to_hw_fifo(eh_dev, page, priv, true))
+	if (!request_to_hw_fifo(eh_dev, page, priv, true, true))
 		return 0;
 
 req_to_sw_fifo:
@@ -1410,9 +1395,9 @@ int eh_compress_batch(struct eh_device *eh_dev, struct page **pages,
 		      void **privs, unsigned int count)
 {
 	unsigned int write_idx;
+	unsigned int last_write_idx = 0;
 	unsigned int submitted = 0;
 	int i;
-	unsigned int sw_fallback_count;
 
 	/* * If sw_fifo is not empty, hardware is already backed up.
 	 * Bypass HW queue and push everything to SW queue immediately.
@@ -1429,7 +1414,8 @@ int eh_compress_batch(struct eh_device *eh_dev, struct page **pages,
 			break; /* Hardware queue full, break out to fallback */
 
 		write_idx = fifo_write_index(eh_dev);
-		eh_setup_descriptor(eh_dev, pages[i], write_idx);
+		eh_setup_descriptor(eh_dev, pages[i], write_idx, false);
+		last_write_idx = write_idx;
 
 		eh_dev->completions[write_idx].priv = privs[i];
 		atomic_inc(&eh_dev->nr_request);
@@ -1440,25 +1426,20 @@ int eh_compress_batch(struct eh_device *eh_dev, struct page **pages,
 	}
 
 	if (submitted > 0) {
+		eh_descriptor(eh_dev, last_write_idx)->intr_request = 1;
 		/* Write barrier to force descriptor writes to be visible everywhere */
 		wmb();
 		/* ONE expensive MMIO write to hardware for the entire batch */
 		eh_write_register(eh_dev, EH_REG_CDESC_WRIDX, eh_dev->write_index);
-		atomic64_add(submitted, &eh_dev->nr_hw_fifo_req);
 	}
 
 	spin_unlock(&eh_dev->fifo_prod_lock);
 
 fallback_sw_fifo:
-    sw_fallback_count = count - submitted;
-    if (sw_fallback_count > 0) {
-        atomic64_add(sw_fallback_count, &eh_dev->nr_sw_fifo_req);
-        
-        /* Fallback unsubmitted items to the software FIFO */
-        for (i = submitted; i < count; i++) {
-            request_to_sw_fifo(eh_dev, pages[i], privs[i]);
-        }
-    }
+	/* Fallback unsubmitted items to the software FIFO */
+	for (i = submitted; i < count; i++) {
+		request_to_sw_fifo(eh_dev, pages[i], privs[i]);
+	}
 
 	return 0;
 }
