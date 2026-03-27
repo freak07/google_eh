@@ -316,6 +316,7 @@ static int create_sw_fifo(struct eh_device *eh_dev, int fifo_size)
 	// Initialize the new lockless list and local list
 	init_llist_head(&eh_dev->sw_fifo);
 	INIT_LIST_HEAD(&eh_dev->local_fifo);
+	spin_lock_init(&eh_dev->consumer_lock);
 
 	for (i = 0; i < fifo_size; i++) {
 		req = kmalloc(sizeof(struct eh_request), GFP_KERNEL);
@@ -645,6 +646,8 @@ static void flush_sw_fifo(struct eh_device *eh_dev)
 {
 	struct eh_request *req, *tmp;
 
+	spin_lock(&eh_dev->consumer_lock);
+
 	/* Move everything from the lockless queue into local_fifo */
 	harvest_sw_fifo(eh_dev);
 
@@ -656,6 +659,8 @@ static void flush_sw_fifo(struct eh_device *eh_dev)
 		list_del(&req->list);
 		pool_free(&eh_dev->pool, req);
 	}
+
+	spin_unlock(&eh_dev->consumer_lock);
 
 	clear_eh_congested();
 }
@@ -673,11 +678,15 @@ static void request_to_sw_fifo(struct eh_device *eh_dev,
 
 	/* Locklessly add to the fallback queue */
 	llist_add(&req->lnode, &eh_dev->sw_fifo);
+
+	flush_sw_fifo(eh_dev);
 }
 
 static void refill_hw_fifo(struct eh_device *eh_dev)
 {
 	struct eh_request *req;
+
+	spin_lock(&eh_dev->consumer_lock);
 
 	/* Check for fresh requests */
 	harvest_sw_fifo(eh_dev);
@@ -689,6 +698,8 @@ static void refill_hw_fifo(struct eh_device *eh_dev)
 			pool_free(&eh_dev->pool, req);
 		}
 	}
+
+	spin_unlock(&eh_dev->consumer_lock);
 
 	clear_eh_congested();
 }

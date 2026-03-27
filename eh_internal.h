@@ -131,6 +131,7 @@ struct eh_device {
 	//struct eh_sw_fifo sw_fifo;
 	struct llist_head sw_fifo;       /* Lockless MPSC submission queue */
 	struct list_head local_fifo;     /* Consumer-only private FIFO */
+	spinlock_t consumer_lock;
 	atomic64_t nr_stall;
 #if IS_ENABLED(CONFIG_SOC_ZUMA) || IS_ENABLED(CONFIG_SOC_LGA)
 	int ip_index;
