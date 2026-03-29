@@ -1439,6 +1439,58 @@ req_to_sw_fifo:
 }
 EXPORT_SYMBOL(eh_compress_page);
 
+int eh_compress_batch(struct eh_device *eh_dev, struct page **pages,
+		      void **privs, unsigned int count)
+{
+	unsigned int write_idx;
+	unsigned int submitted = 0;
+	int i;
+
+	/* * If sw_fifo is not empty, hardware is already backed up.
+	 * Bypass HW queue and push everything to SW queue immediately.
+	 */
+	if (!sw_fifo_empty(&eh_dev->sw_fifo))
+		goto fallback_sw_fifo;
+
+	eh_declare_busy(eh_dev);
+
+	spin_lock(&eh_dev->fifo_prod_lock);
+
+	for (i = 0; i < count; i++) {
+		if (fifo_full(eh_dev))
+			break; /* Hardware queue full, break out to fallback */
+
+		write_idx = fifo_write_index(eh_dev);
+		eh_setup_descriptor(eh_dev, pages[i], write_idx);
+
+		eh_dev->completions[write_idx].priv = privs[i];
+		atomic_inc(&eh_dev->nr_request);
+
+		/* Advance our internal write index */
+		eh_dev->write_index = (eh_dev->write_index + 1) & eh_dev->fifo_color_mask;
+		submitted++;
+	}
+
+	if (submitted > 0) {
+		/* Write barrier to force descriptor writes to be visible everywhere */
+		wmb();
+		/* ONE expensive MMIO write to hardware for the entire batch */
+		eh_write_register(eh_dev, EH_REG_CDESC_WRIDX, eh_dev->write_index);
+		wake_up(&eh_dev->comp_wq);
+	}
+
+	spin_unlock(&eh_dev->fifo_prod_lock);
+
+fallback_sw_fifo:
+	/* Fallback unsubmitted items to the software FIFO */
+	for (i = submitted; i < count; i++) {
+		request_to_sw_fifo(eh_dev, pages[i], privs[i]);
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(eh_compress_batch);
+
 void eh_prepare_decompress(struct eh_device *eh_dev)
 {
 	eh_hwacg_refresh_idle_timer(eh_dev);

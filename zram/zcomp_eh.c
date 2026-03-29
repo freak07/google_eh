@@ -11,23 +11,35 @@ static int zcomp_flush(struct zcomp *comp)
 {
 	int err = 0;
 	LIST_HEAD(req_list);
+	struct zcomp_cookie *cookie;
 
+	/* Arrays to hold the batch data */
+	struct page *pages[ZCOMP_BLK_MAX_REQUEST_COUNT];
+	void *privs[ZCOMP_BLK_MAX_REQUEST_COUNT];
+	unsigned int count = 0;
 
 	spin_lock(&comp->request_lock);
 	list_splice_init(&comp->request_list, &req_list);
 	comp->pend_request = 0;
 	spin_unlock(&comp->request_lock);
 
+	/* Unroll the linked list into standard arrays */
 	while (!list_empty(&req_list)) {
-		struct zcomp_cookie *cookie;
-
 		cookie = list_last_entry(&req_list, struct zcomp_cookie, list);
 		list_del(&cookie->list);
-		eh_compress_page(comp->private, cookie->page, cookie);
+
+		pages[count] = cookie->page;
+		privs[count] = cookie;
+		count++;
 	}
+
+	/* Submit the entire batch in one shot */
+	if (count > 0)
+		err = eh_compress_batch(comp->private, pages, privs, count);
 
 	return err;
 }
+
 static void zcomp_unplug(struct blk_plug_cb *cb, bool from_schedule)
 {
 	zcomp_flush((struct zcomp *)(cb->data));
